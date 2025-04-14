@@ -13,6 +13,8 @@ MARIADB_GIT_BRANCH="11.7"
 rm -rf "$TARGET_DIR" "$DOCKER_CONTEXT" "$DOCKER_OUTPUT"
 mkdir -p "$TARGET_DIR/mariadb"
 mkdir -p "$DIST_DIR"
+mkdir -p "$DOCKER_CONTEXT/patches"
+cp -r patches/ "$DOCKER_CONTEXT"/patches/
 
 # Prepare Docker context to build MariaDB from source
 mkdir -p "$DOCKER_CONTEXT" "$DOCKER_OUTPUT"
@@ -31,8 +33,16 @@ RUN dnf groupinstall -y "Development Tools" && \
 WORKDIR /build
 
 RUN mkdir -p /out/bin /out/lib && \
-    git clone --depth 1 --branch \${MARIADB_GIT_BRANCH} https://github.com/MariaDB/server mariadb-server && \
-    cmake -S mariadb-server -B build \
+    git clone --depth 1 --branch \${MARIADB_GIT_BRANCH} https://github.com/MariaDB/server mariadb-server
+
+# Copy and apply all patch files
+COPY patches/ patches/
+RUN for patch in /build/patches/*.patch; do \
+      echo "📦 Applying \$patch" && \
+      git -C mariadb-server apply "\$patch" || exit 1; \
+    done
+
+RUN cmake -S mariadb-server -B build \
         -DCMAKE_INSTALL_PREFIX=/out \
         -DWITH_UNIT_TESTS=0 \
         -DWITH_SSL=system \
@@ -42,8 +52,9 @@ RUN mkdir -p /out/bin /out/lib && \
     cmake --build build --parallel 4 && \
     cmake --install build
 
+
 # Pre-initialize a clean data directory
-RUN mkdir -p /out/micydb && /out/scripts/mariadb-install-db --datadir=/out/micydb
+RUN mkdir -p /out/micydb && /out/scripts/mariadb-install-db --datadir=/out/micydb --auth-root-authentication-method=normal
 
 # Capture libraries not present on AL2023 (lambda)
 RUN mkdir -p /out/libs/ && ldd /out/bin/mariadbd | grep '=> /' | awk '{print \$3}' | while read -r lib; do cp -v "\$lib" /out/libs/; done
@@ -69,12 +80,13 @@ tar -xf "$PWD/$TARGET_DIR/mariadb/mariadb-bundle.tar.gz" -C "$TARGET_DIR" --stri
 mkdir -p "$TARGET_DIR/lambda/bin/"
 mkdir -p "$TARGET_DIR/lambda/lib/"
 mkdir -p "$TARGET_DIR/lambda/share/"
+mkdir -p "$TARGET_DIR/lambda/data/"
 
 echo "🔍 Copying mariadbd and shared libs to Lambda package..."
 cp "$TARGET_DIR"/bin/mariadbd "$TARGET_DIR/lambda/bin/"
 cp -r "$TARGET_DIR"/libs/* "$TARGET_DIR/lambda/lib/"
 cp "$TARGET_DIR"/share/*.sql "$TARGET_DIR/lambda/share/"
-
+cp -r "$TARGET_DIR"/micydb/* "$TARGET_DIR/lambda/data/"
 
 echo "🛠️ Building Go Lambda bootstrap (Go 1.24.1)..."
 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o "$TARGET_DIR/lambda/bootstrap" ./cmd/micysql

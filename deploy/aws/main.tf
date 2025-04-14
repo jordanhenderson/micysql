@@ -20,6 +20,8 @@ module "micysql" {
 
   environment_variables = {
     AWS_LAMBDA_EXEC_WRAPPER = "/opt/bootstrap"
+    DB_USER = var.DB_USER
+    DB_PASS = var.DB_PASS
   }
 
   layer_arns = [

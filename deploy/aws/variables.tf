@@ -13,3 +13,11 @@ variable "PROJECT_NAME" {
 variable "S3_BUCKET" {
   type = string
 }
+
+variable "DB_USER" {
+  type = string
+}
+
+variable "DB_PASS" {
+  type = string
+}

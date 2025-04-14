@@ -1,0 +1,20 @@
+Subject: [PATCH] Always use sparse (no fallocate on Lambda)
+---
+Index: storage/innobase/os/os0file.cc
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/storage/innobase/os/os0file.cc b/storage/innobase/os/os0file.cc
+--- a/storage/innobase/os/os0file.cc	(revision 80067a69feaeb5df30abb1bfaf7d4e713ccbf027)
++++ b/storage/innobase/os/os0file.cc	(date 1744616050960)
+@@ -1559,6 +1559,9 @@
+ {
+ 	ut_ad(!(size & 4095));
+ 
++	// 🔒 Patch: force sparse to avoid fallocate() in Lambda
++   is_sparse = true;
++
+ 	if (is_sparse) {
+ 		bool success = !ftruncate(file, size);
+ 		if (!success) {

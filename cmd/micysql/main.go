@@ -1,8 +1,8 @@
-// main.go
 package main
 
 import (
 	"database/sql"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -21,71 +21,57 @@ const (
 )
 
 var (
-	db        *sql.DB
-	dbOnce    sync.Once
-	dbReady   = false
-	dbReadyMu sync.Mutex
+	db     *sql.DB
+	dbOnce sync.Once
+
+	dsn = "root@unix(" + mysqlSock + ")/mysql"
 )
 
 func launchMariaDB() {
-	log.Println("🧊 MicySQL cold boot initiated...")
+	log.Println("🧊 MicySQL background launch initiated...")
 
-	// Ensure data dir exists
-	initDataDir := ""
 	if _, err := os.Stat(mysqlData); os.IsNotExist(err) {
 		os.Mkdir(mysqlData, 0755)
-		initDataDir = "--initialize-insecure"
+		log.Println("📂 Copying prebuilt data dir from /var/task/data to /tmp/micydb...")
+		err := exec.Command("cp", "-a", "/var/task/data/.", mysqlData).Run()
+		if err != nil {
+			log.Fatalf("❌ Failed to copy data dir: %v", err)
+		}
 	}
 
 	os.Setenv("LD_LIBRARY_PATH", "/var/task/lib")
 
-	log.Println("🚀 Starting mariadbd daemon...")
-	cmd := exec.Command(
-		"/var/task/bin/mariadbd",
-		"--datadir="+mysqlData,
-		"--socket="+mysqlSock,
-		"--no-defaults",
+	args := []string{
+		"--user=root",
+		"--datadir=" + mysqlData,
+		"--socket=" + mysqlSock,
 		"--skip-networking",
-		initDataDir,
 		"--pid-file=/tmp/mysqld.pid",
-		"--log-error=/tmp/mysqld.err",
-	)
+		"--innodb-use-native-aio=0",
+		"--innodb-flush-method=fsync",
+		"--innodb-data-file-path=ibdata1:2M:autoextend:max:256M",
+		"--innodb-temp-data-file-path=ibtmp1:2M:autoextend:max:64M",
+		"--innodb-buffer-pool-size=64M",
+		"--innodb-file-per-table=1",
+	}
+
+	log.Printf("📦 Launching mariadbd with args:\n  %s", strings.Join(args, " "))
+
+	cmd := exec.Command("/var/task/bin/mariadbd", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
 		log.Fatalf("❌ Failed to start mariadbd: %v", err)
 	}
-
-	waitForSocket(mysqlSock, 30*time.Second)
-
-	dsn := "root@unix(" + mysqlSock + ")/mysql"
-	dbLocal, err := sql.Open("mysql", dsn)
-	if err != nil {
-		log.Fatalf("❌ Failed to open DB: %v", err)
-	}
-
-	for i := 0; i < 20; i++ {
-		if err := dbLocal.Ping(); err == nil {
-			db = dbLocal
-			log.Println("✅ MariaDB responds to queries")
-			dbReadyMu.Lock()
-			dbReady = true
-			dbReadyMu.Unlock()
-			return
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	log.Fatal("❌ MariaDB ping timed out")
 }
 
-func waitForSocket(path string, timeout time.Duration) {
-	log.Printf("⏳ Waiting for socket at %s (max %s)...", path, timeout)
+func waitForMariaDB(timeout time.Duration) {
+	log.Printf("⏳ Waiting for MariaDB socket at %s (max %s)...", mysqlSock, timeout)
 	deadline := time.Now().Add(timeout)
 	for {
-		if _, err := os.Stat(path); err == nil {
-			log.Println("✅ Socket ready:", path)
+		if _, err := os.Stat(mysqlSock); err == nil {
+			log.Println("✅ Socket ready.")
 			return
 		}
 		if time.Now().After(deadline) {
@@ -96,13 +82,51 @@ func waitForSocket(path string, timeout time.Duration) {
 }
 
 func ensureMariaDBReady() {
-	dbOnce.Do(func() {
-		launchMariaDB()
-	})
+	// Only block here on first request
+	waitForMariaDB(300 * time.Second)
+
+	conn, err := sql.Open("mysql", dsn)
+	if err != nil {
+		log.Printf("❌ Failed to connect to DB: %v", err)
+	}
+	if err := conn.Ping(); err != nil {
+		log.Printf("❌ Ping failed: %v", err)
+	}
+	db = conn
+	log.Println("✅ Connected to MariaDB.")
+
 }
 
 func main() {
 	icebreak.InitLambda()
+	launchMariaDB() // Non-blocking mariadbd startup during init
+	waitForMariaDB(9 * time.Second)
+
+	conn, err := sql.Open("mysql", dsn)
+	if err != nil {
+		log.Printf("❌ Failed to connect to DB: %v", err)
+	}
+	if err := conn.Ping(); err != nil {
+		log.Printf("❌ Ping failed: %v", err)
+	}
+	db = conn
+
+	username := os.Getenv("MARIADB_USER")
+	password := os.Getenv("MARIADB_PASSWORD")
+
+	// Create user if not exists
+	query := fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'localhost' IDENTIFIED BY ?", username)
+	_, err = db.Exec(query, password)
+	if err != nil {
+		log.Printf("❌ Failed to create user: %v", err)
+	}
+
+	// Grant full access (or adjust privileges)
+	_, err = db.Exec("GRANT ALL PRIVILEGES ON *.* TO ?@'localhost' WITH GRANT OPTION", username)
+	if err != nil {
+		log.Printf("❌ Failed to grant access for user user: %v", err)
+	}
+
 	app := fiber.New()
 
 	app.Post("/execute", func(c *fiber.Ctx) error {

@@ -2,10 +2,10 @@ package main
 
 import (
 	"database/sql"
-	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -111,22 +111,6 @@ func main() {
 	}
 	db = conn
 
-	username := os.Getenv("MARIADB_USER")
-	password := os.Getenv("MARIADB_PASSWORD")
-
-	// Create user if not exists
-	query := fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'localhost' IDENTIFIED BY ?", username)
-	_, err = db.Exec(query, password)
-	if err != nil {
-		log.Printf("❌ Failed to create user: %v", err)
-	}
-
-	// Grant full access (or adjust privileges)
-	_, err = db.Exec("GRANT ALL PRIVILEGES ON *.* TO ?@'localhost' WITH GRANT OPTION", username)
-	if err != nil {
-		log.Printf("❌ Failed to grant access for user user: %v", err)
-	}
-
 	app := fiber.New()
 
 	app.Post("/execute", func(c *fiber.Ctx) error {
@@ -143,33 +127,81 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"error": "Empty SQL"})
 		}
 
-		rows, err := db.Query(req.SQL)
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
-		defer rows.Close()
-
-		cols, _ := rows.Columns()
-		results := []map[string]interface{}{}
-
-		for rows.Next() {
-			values := make([]interface{}, len(cols))
-			ptrs := make([]interface{}, len(cols))
-			for i := range values {
-				ptrs[i] = &values[i]
+		sqlText := strings.TrimSpace(req.SQL)
+		if strings.HasPrefix(strings.ToUpper(sqlText), "SELECT") {
+			rows, err := db.Query(req.SQL)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 			}
-			rows.Scan(ptrs...)
-			rowMap := map[string]interface{}{}
-			for i, col := range cols {
-				rowMap[col] = values[i]
+			defer rows.Close()
+
+			cols, _ := rows.Columns()
+			colTypes, _ := rows.ColumnTypes()
+			results := []map[string]interface{}{}
+
+			for rows.Next() {
+				values := make([]interface{}, len(cols))
+				raw := make([]sql.RawBytes, len(cols))
+
+				for i := range raw {
+					values[i] = &raw[i]
+				}
+
+				if err := rows.Scan(values...); err != nil {
+					return c.Status(500).JSON(fiber.Map{"error": "Row scan failed", "details": err.Error()})
+				}
+
+				rowMap := map[string]interface{}{}
+				for i, col := range cols {
+					rawVal := raw[i]
+					if rawVal == nil {
+						rowMap[col] = nil
+						continue
+					}
+
+					// Convert by database type
+					switch colTypes[i].DatabaseTypeName() {
+					case "INT", "TINYINT", "BIGINT", "SMALLINT", "MEDIUMINT":
+						if val, err := strconv.Atoi(string(rawVal)); err == nil {
+							rowMap[col] = val
+						} else {
+							rowMap[col] = string(rawVal)
+						}
+					case "FLOAT", "DOUBLE", "DECIMAL":
+						if val, err := strconv.ParseFloat(string(rawVal), 64); err == nil {
+							rowMap[col] = val
+						} else {
+							rowMap[col] = string(rawVal)
+						}
+					case "VARCHAR", "TEXT", "CHAR", "ENUM":
+						rowMap[col] = string(rawVal)
+					case "DATE", "DATETIME", "TIMESTAMP":
+						rowMap[col] = string(rawVal) // You can parse into time.Time if desired
+					default:
+						// Fallback: just send as string
+						rowMap[col] = string(rawVal)
+					}
+				}
+				results = append(results, rowMap)
 			}
-			results = append(results, rowMap)
+
+			return c.JSON(fiber.Map{
+				"columns": cols,
+				"rows":    results,
+			})
+		} else {
+			// INSERT/UPDATE/DELETE/DDL
+			result, err := db.Exec(sqlText)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			}
+			rowsAffected, _ := result.RowsAffected()
+			return c.JSON(fiber.Map{
+				"result":        "ok",
+				"rows_affected": rowsAffected,
+			})
 		}
 
-		return c.JSON(fiber.Map{
-			"columns": cols,
-			"rows":    results,
-		})
 	})
 
 	port := os.Getenv("PORT")
